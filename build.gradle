@@ -34,7 +34,7 @@ repositories {
     }
 }
 
-def compileAvroVersion = "1.11.3"
+def compileAvroVersion = "1.11.4"
 
 // Write the plugin's classpath to a file to share with the tests
 task createClasspathManifest {
