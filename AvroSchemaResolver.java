@@ -1,5 +1,3 @@
-package org.example;
-
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.avro.Schema;
@@ -16,114 +14,100 @@ public class AvroSchemaResolver {
 
     public static void main(String[] args) throws Exception {
         if (args.length < 2) {
-            System.err.println("Usage: java AvroSchemaResolver <inputDir> <outputFile>");
+            System.err.println("Usage: java AvroSchemaResolver <inputDir> <outputDir>");
             System.exit(1);
         }
+
         Path inputDir = Paths.get(args[0]);
-        Path outputFile = Paths.get(args[1]);
+        Path outputDir = Paths.get(args[1]);
+        Files.createDirectories(outputDir);
 
         ObjectMapper mapper = new ObjectMapper();
 
-        // Read all schemas
+        // Step 1: Load all schemas
         Map<String, String> schemaJsons = new LinkedHashMap<>();
         try (Stream<Path> stream = Files.walk(inputDir)) {
-            for (Path file : stream.filter(path -> path.toString().endsWith(".avsc")).collect(Collectors.toList())) {
-                String jsonText = Files.readString(file, StandardCharsets.UTF_8);
-                if (jsonText.startsWith("\uFEFF")) {
-                    jsonText = jsonText.substring(1);
-                }
-                JsonNode root = mapper.readTree(jsonText);
+            for (Path path : stream.filter(p -> p.toString().endsWith(".avsc")).collect(Collectors.toList())) {
+                String content = Files.readString(path, StandardCharsets.UTF_8);
+                if (content.startsWith("\uFEFF")) content = content.substring(1);
+                JsonNode root = mapper.readTree(content);
+
                 if (root.isArray()) {
-                    for (JsonNode schemaNode : root) {
-                        processSchemaNode(schemaNode, schemaJsons, mapper);
-                    }
+                    for (JsonNode node : root) processSchemaNode(node, schemaJsons, mapper);
                 } else if (root.has("protocol") && root.has("types")) {
-                    for (JsonNode schemaNode : root.get("types")) {
-                        processSchemaNode(schemaNode, schemaJsons, mapper);
-                    }
+                    for (JsonNode node : root.get("types")) processSchemaNode(node, schemaJsons, mapper);
                 } else {
                     processSchemaNode(root, schemaJsons, mapper);
                 }
             }
         }
 
-        // Extract dependencies
-        Map<String, Set<String>> dependencies = new HashMap<>();
-        for (Map.Entry<String, String> e : schemaJsons.entrySet()) {
-            JsonNode root = mapper.readTree(e.getValue());
+        // Step 2: Build dependency graph
+        Map<String, Set<String>> dependencies = new LinkedHashMap<>();
+        for (var entry : schemaJsons.entrySet()) {
+            JsonNode root = mapper.readTree(entry.getValue());
             Set<String> deps = new HashSet<>();
             findDependencies(root, deps, schemaJsons.keySet());
-            dependencies.put(e.getKey(), deps);
+            dependencies.put(entry.getKey(), deps);
         }
 
-        // Topological sort
-        List<String> sortedNames = topologicalSort(schemaJsons.keySet(), dependencies);
+        // Step 3: Topological sort
+        List<String> sortedSchemas = topologicalSort(schemaJsons.keySet(), dependencies);
 
-        System.out.println("Schema parse order (dependencies first):");
-        for (String name : sortedNames) {
-            System.out.println("  " + name);
+        System.out.println("Schema output order:");
+        for (int i = 0; i < sortedSchemas.size(); i++) {
+            System.out.printf("  %02d: %s%n", i + 1, sortedSchemas.get(i));
         }
 
-        // Parse all schemas in sorted order with one parser
+        // Step 4: Parse schemas with one parser
         Schema.Parser parser = new Schema.Parser();
         Map<String, Schema> fullNameToSchema = new HashMap<>();
-        List<Schema> parsedSchemasOrdered = new ArrayList<>();
-        for (String fullname : sortedNames) {
-            String json = schemaJsons.get(fullname);
-            if (json == null) {
-                throw new RuntimeException("Schema JSON missing for: " + fullname);
+        for (String fullName : sortedSchemas) {
+            Schema schema = parser.parse(schemaJsons.get(fullName));
+            fullNameToSchema.put(fullName, schema);
+        }
+
+        // Step 5: Output each schema to its own file
+        for (int i = 0; i < sortedSchemas.size(); i++) {
+            String fullName = sortedSchemas.get(i);
+            Schema schema = replaceInlineWithParsedSchemas(fullNameToSchema.get(fullName), fullNameToSchema);
+
+            String fileName = String.format("%02d_%s.avsc", i + 1, fullName.replaceAll("[^A-Za-z0-9_.]", "_"));
+            Path out = outputDir.resolve(fileName);
+
+            try (PrintWriter writer = new PrintWriter(Files.newBufferedWriter(out, StandardCharsets.UTF_8))) {
+                writer.println(schema.toString(true));
             }
-            Schema schema = parser.parse(json);
-            fullNameToSchema.put(fullname, schema);
-            parsedSchemasOrdered.add(schema);
-        }
 
-        // Replace inline named schemas with references by reusing existing named Schema objects
-        List<Schema> normalizedSchemas = new ArrayList<>();
-        for (Schema s : parsedSchemasOrdered) {
-            normalizedSchemas.add(replaceInlineWithParsedSchemas(s, fullNameToSchema));
+            System.out.println("✓ Wrote " + fileName);
         }
-
-        // Write combined schemas as array
-        try (PrintWriter writer = new PrintWriter(Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8))) {
-            writer.println("[");
-            for (int i = 0; i < normalizedSchemas.size(); i++) {
-                writer.print(normalizedSchemas.get(i).toString(true));
-                if (i < normalizedSchemas.size() - 1) {
-                    writer.println(",");
-                }
-            }
-            writer.println("\n]");
-        }
-
-        System.out.println("Combined schema written to: " + outputFile);
     }
 
-    private static void processSchemaNode(JsonNode schemaNode, Map<String, String> schemaJsons, ObjectMapper mapper) throws IOException {
-        String fullName = getFullName(schemaNode);
-        if (fullName == null) {
-            throw new RuntimeException("Schema missing 'name' field or namespace");
+    private static void processSchemaNode(JsonNode node, Map<String, String> schemaMap, ObjectMapper mapper) throws IOException {
+        String fullName = getFullName(node);
+        String json = mapper.writeValueAsString(node);
+
+        if (fullName == null) throw new RuntimeException("Missing name/namespace in schema");
+
+        if (schemaMap.containsKey(fullName)) {
+            System.err.println("Warning: duplicate schema for " + fullName + ", overriding.");
         }
-        String jsonStr = mapper.writeValueAsString(schemaNode);
-        if (schemaJsons.containsKey(fullName)) {
-            System.err.println("Warning: duplicate schema detected for '" + fullName + "'. Overriding previous definition.");
-        }
-        schemaJsons.put(fullName, jsonStr);
+        schemaMap.put(fullName, json);
     }
 
-    static String getFullName(JsonNode root) {
-        if (!root.has("name")) return null;
-        String name = root.get("name").asText();
-        return root.has("namespace") ? root.get("namespace").asText() + "." + name : name;
+    private static String getFullName(JsonNode node) {
+        if (!node.has("name")) return null;
+        String name = node.get("name").asText();
+        return node.has("namespace") ? node.get("namespace").asText() + "." + name : name;
     }
 
-    static void findDependencies(JsonNode node, Set<String> deps, Set<String> knownNames) {
+    private static void findDependencies(JsonNode node, Set<String> deps, Set<String> knownNames) {
         if (node == null || node.isNull()) return;
 
         if (node.isTextual()) {
-            String typeName = node.asText();
-            String fullName = resolveFullName(knownNames, typeName);
-            if (fullName != null) deps.add(fullName);
+            String type = node.asText();
+            String full = resolveFullName(type, knownNames);
+            if (full != null) deps.add(full);
             return;
         }
 
@@ -133,14 +117,16 @@ public class AvroSchemaResolver {
                 for (JsonNode child : node) findDependencies(child, deps, knownNames);
                 return;
             }
+
             if (typeNode.isTextual()) {
-                String type = typeNode.asText();
-                switch (type) {
+                String typeValue = typeNode.asText();
+                switch (typeValue) {
                     case "record":
-                    case "error":
+                    case "enum":
+                    case "fixed":
                         if (node.has("fields")) {
-                            for (JsonNode field : node.get("fields")) {
-                                findDependencies(field.get("type"), deps, knownNames);
+                            for (JsonNode f : node.get("fields")) {
+                                findDependencies(f.get("type"), deps, knownNames);
                             }
                         }
                         break;
@@ -152,21 +138,16 @@ public class AvroSchemaResolver {
                         break;
                     case "union":
                         if (node.has("types")) {
-                            for (JsonNode t : node.get("types")) {
-                                findDependencies(t, deps, knownNames);
-                            }
+                            for (JsonNode t : node.get("types")) findDependencies(t, deps, knownNames);
                         }
                         break;
                     default:
-                        String fullName = resolveFullName(knownNames, type);
-                        if (fullName != null) deps.add(fullName);
+                        String resolved = resolveFullName(typeValue, knownNames);
+                        if (resolved != null) deps.add(resolved);
                 }
             } else if (typeNode.isArray()) {
-                for (JsonNode t : typeNode) {
-                    findDependencies(t, deps, knownNames);
-                }
+                for (JsonNode t : typeNode) findDependencies(t, deps, knownNames);
             }
-            return;
         }
 
         if (node.isArray()) {
@@ -174,89 +155,88 @@ public class AvroSchemaResolver {
         }
     }
 
-    private static String resolveFullName(Set<String> knownNames, String typeName) {
-        if (knownNames.contains(typeName)) return typeName;
+    private static String resolveFullName(String typeName, Set<String> known) {
+        if (known.contains(typeName)) return typeName;
         if (!typeName.contains(".")) {
-            List<String> matches = knownNames.stream()
-                    .filter(n -> n.equals(typeName) || n.endsWith("." + typeName))
+            List<String> matches = known.stream()
+                    .filter(name -> name.endsWith("." + typeName))
                     .collect(Collectors.toList());
             if (matches.size() == 1) return matches.get(0);
-            else if (matches.size() > 1) {
-                System.err.println("Warning: Ambiguous unqualified type name '" + typeName + "' matched multiple schemas: " + matches);
+            if (matches.size() > 1) {
+                System.err.println("Ambiguous simple type name: " + typeName + " → " + matches);
             }
         }
         return null;
     }
 
-    static List<String> topologicalSort(Set<String> names, Map<String, Set<String>> dependencies) {
-        List<String> sorted = new ArrayList<>();
+    private static List<String> topologicalSort(Set<String> schemaNames, Map<String, Set<String>> deps) {
+        List<String> result = new ArrayList<>();
         Set<String> visited = new HashSet<>();
         Set<String> visiting = new HashSet<>();
-        for (String name : names) dfs(name, dependencies, visited, visiting, sorted);
-        return sorted;
+
+        for (String name : schemaNames) {
+            dfs(name, deps, visited, visiting, result);
+        }
+
+        return result;
     }
 
-    private static void dfs(String name, Map<String, Set<String>> deps, Set<String> visited, Set<String> visiting, List<String> sorted) {
+    private static void dfs(String name, Map<String, Set<String>> deps,
+                            Set<String> visited, Set<String> visiting, List<String> result) {
         if (visited.contains(name)) return;
-        if (visiting.contains(name)) throw new RuntimeException("Cycle detected in schema dependencies at: " + name);
+        if (visiting.contains(name)) throw new RuntimeException("Cycle detected at: " + name);
+
         visiting.add(name);
-        for (String dep : deps.getOrDefault(name, Collections.emptySet())) {
-            dfs(dep, deps, visited, visiting, sorted);
+        for (String dep : deps.getOrDefault(name, Set.of())) {
+            dfs(dep, deps, visited, visiting, result);
         }
         visiting.remove(name);
         visited.add(name);
-        sorted.add(name);
+        result.add(name);
     }
 
-    /**
-     * Recursively replaces inline named schemas inside the given schema with references from parsed schema map.
-     * This prevents nested inline full definitions and produces output where dependencies refer by name.
-     */
     private static Schema replaceInlineWithParsedSchemas(Schema schema, Map<String, Schema> fullNameToSchema) {
         switch (schema.getType()) {
             case RECORD:
-             {
-                List<Schema.Field> newFields = new ArrayList<>();
-                for (Schema.Field field : schema.getFields()) {
-                    Schema replacedSchema = replaceInlineWithParsedSchemas(field.schema(), fullNameToSchema);
-                    if (isNamedType(replacedSchema)) {
-                        Schema existing = fullNameToSchema.get(replacedSchema.getFullName());
-                        if (existing != null) {
-                            replacedSchema = existing;
-                        }
+                List<Schema.Field> fields = new ArrayList<>();
+                for (Schema.Field f : schema.getFields()) {
+                    Schema ref = replaceInlineWithParsedSchemas(f.schema(), fullNameToSchema);
+                    if (isNamedType(ref)) {
+                        Schema shared = fullNameToSchema.get(ref.getFullName());
+                        if (shared != null) ref = shared;
                     }
-                    Schema.Field newField = new Schema.Field(field.name(), replacedSchema, field.doc(), field.defaultVal(), field.order());
-                    newFields.add(newField);
+                    fields.add(new Schema.Field(f.name(), ref, f.doc(), f.defaultVal(), f.order()));
                 }
-                Schema newRecord = Schema.createRecord(schema.getName(), schema.getDoc(), schema.getNamespace(), schema.isError());
-                newRecord.setFields(newFields);
-                return newRecord;
-            }
+                Schema copy = Schema.createRecord(schema.getName(), schema.getDoc(), schema.getNamespace(), false);
+                copy.setFields(fields);
+                return copy;
+
             case ARRAY:
                 return Schema.createArray(replaceInlineWithParsedSchemas(schema.getElementType(), fullNameToSchema));
+
             case MAP:
                 return Schema.createMap(replaceInlineWithParsedSchemas(schema.getValueType(), fullNameToSchema));
-            case UNION: {
-                List<Schema> newTypes = new ArrayList<>();
+
+            case UNION:
+                List<Schema> unionItems = new ArrayList<>();
                 for (Schema s : schema.getTypes()) {
-                    Schema replacedSchema = replaceInlineWithParsedSchemas(s, fullNameToSchema);
-                    if (isNamedType(replacedSchema)) {
-                        Schema existing = fullNameToSchema.get(replacedSchema.getFullName());
-                        if (existing != null) {
-                            replacedSchema = existing;
-                        }
+                    Schema ref = replaceInlineWithParsedSchemas(s, fullNameToSchema);
+                    if (isNamedType(ref)) {
+                        Schema shared = fullNameToSchema.get(ref.getFullName());
+                        if (shared != null) ref = shared;
                     }
-                    newTypes.add(replacedSchema);
+                    unionItems.add(ref);
                 }
-                return Schema.createUnion(newTypes);
-            }
+                return Schema.createUnion(unionItems);
+
             default:
                 return schema;
         }
     }
 
-    private static boolean isNamedType(Schema schema) {
-        Schema.Type t = schema.getType();
-        return t == Schema.Type.RECORD || t == Schema.Type.ENUM || t == Schema.Type.FIXED ;
+    private static boolean isNamedType(Schema s) {
+        return s.getType() == Schema.Type.RECORD ||
+               s.getType() == Schema.Type.ENUM ||
+               s.getType() == Schema.Type.FIXED;
     }
 }
