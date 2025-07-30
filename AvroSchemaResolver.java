@@ -1,4 +1,3 @@
-package org.example;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.avro.Schema;
@@ -23,13 +22,13 @@ public class AvroSchemaResolver {
 
         ObjectMapper mapper = new ObjectMapper();
 
-        // 1. Read all schemas from all .avsc files with support for multiple schemas per file
+        // 1. Read all schemas from .avsc files (single or multiple schemas per file)
         Map<String, String> schemaJsons = new LinkedHashMap<>();
 
         try (Stream<Path> stream = Files.walk(inputDir)) {
             List<Path> files = stream
-                    .filter(path -> path.toString().endsWith(".avsc"))
-                    .collect(Collectors.toList());
+                .filter(path -> path.toString().endsWith(".avsc"))
+                .collect(Collectors.toList());
 
             for (Path file : files) {
                 String jsonText = Files.readString(file, StandardCharsets.UTF_8);
@@ -40,12 +39,12 @@ public class AvroSchemaResolver {
                 JsonNode root = mapper.readTree(jsonText);
 
                 if (root.isArray()) {
-                    // Multiple schema array
+                    // Multiple schemas in an array
                     for (JsonNode schemaNode : root) {
                         processSchemaNode(schemaNode, schemaJsons, mapper);
                     }
                 } else if (root.has("protocol") && root.has("types")) {
-                    // Avro protocol JSON with "types" array of schemas
+                    // Avro protocol file
                     JsonNode typesNode = root.get("types");
                     for (JsonNode schemaNode : typesNode) {
                         processSchemaNode(schemaNode, schemaJsons, mapper);
@@ -66,7 +65,7 @@ public class AvroSchemaResolver {
             dependencies.put(entry.getKey(), deps);
         }
 
-        // 3. Topological sort of schemas by dependencies
+        // 3. Topological sort
         List<String> sortedNames = topologicalSort(schemaJsons.keySet(), dependencies);
 
         System.out.println("Schema parse order (dependencies first):");
@@ -74,7 +73,7 @@ public class AvroSchemaResolver {
             System.out.println("  " + name);
         }
 
-        // 4. Parse schemas in correct order using one shared parser
+        // 4. Parse schemas in order with one parser
         Schema.Parser parser = new Schema.Parser();
         List<Schema> parsedSchemas = new ArrayList<>();
         for (String name : sortedNames) {
@@ -85,7 +84,7 @@ public class AvroSchemaResolver {
             parsedSchemas.add(parser.parse(schemaJson));
         }
 
-        // 5. Write combined schemas as JSON array to output file
+        // 5. Write combined schemas as JSON array
         try (PrintWriter writer = new PrintWriter(Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8))) {
             writer.println("[");
             for (int i = 0; i < parsedSchemas.size(); i++) {
@@ -113,8 +112,8 @@ public class AvroSchemaResolver {
     }
 
     /**
-     * Extract the fully qualified name of a schema from its JSON representation.
-     * If 'namespace' is missing, just uses 'name'.
+     * Extract the full name of the schema from JSON node by concatenating namespace and name.
+     * Returns null if name is missing.
      */
     static String getFullName(JsonNode root) {
         if (!root.has("name")) {
@@ -128,18 +127,17 @@ public class AvroSchemaResolver {
     }
 
     /**
-     * Recursively find user-defined schema dependencies in the given JSON node.
-     * @param node the JSON node to inspect
-     * @param deps set of dependencies collected (full names)
-     * @param knownNames set of known schema full names to detect user-defined types
+     * Recursively find user-defined schema dependencies from JSON node.
+     * Resolves type names to fully qualified names where possible.
      */
     static void findDependencies(JsonNode node, Set<String> deps, Set<String> knownNames) {
         if (node == null || node.isNull()) return;
 
         if (node.isTextual()) {
             String typeName = node.asText();
-            if (knownNames.contains(typeName)) {
-                deps.add(typeName);
+            String fullName = resolveFullName(knownNames, typeName);
+            if (fullName != null) {
+                deps.add(fullName);
             }
             return;
         }
@@ -147,7 +145,7 @@ public class AvroSchemaResolver {
         if (node.isObject()) {
             JsonNode typeNode = node.get("type");
             if (typeNode == null) {
-                // Defensive: no "type" field, traverse children
+                // No "type" field, recursively check children
                 for (JsonNode child : node) {
                     findDependencies(child, deps, knownNames);
                 }
@@ -175,19 +173,20 @@ public class AvroSchemaResolver {
                     case "union":
                         JsonNode types = node.get("types");
                         if (types != null) {
-                            for (JsonNode typeEl : types) {
-                                findDependencies(typeEl, deps, knownNames);
+                            for (JsonNode t : types) {
+                                findDependencies(t, deps, knownNames);
                             }
                         }
                         break;
                     default:
-                        if (knownNames.contains(type)) {
-                            deps.add(type);
+                        String fullName = resolveFullName(knownNames, type);
+                        if (fullName != null) {
+                            deps.add(fullName);
                         }
                 }
             } else if (typeNode.isArray()) {
-                for (JsonNode typeEl : typeNode) {
-                    findDependencies(typeEl, deps, knownNames);
+                for (JsonNode t : typeNode) {
+                    findDependencies(t, deps, knownNames);
                 }
             }
             return;
@@ -201,9 +200,33 @@ public class AvroSchemaResolver {
     }
 
     /**
-     * Perform topological sort of schemas by dependencies.
-     * Dependencies will come before dependents in the returned list.
-     * Throws RuntimeException on cycle detection.
+     * Resolve a possibly unqualified typeName against known full names.
+     * Returns matching fully qualified name if unique match found, or null otherwise.
+     */
+    private static String resolveFullName(Set<String> knownNames, String typeName) {
+        if (knownNames.contains(typeName)) {
+            return typeName;
+        }
+        if (!typeName.contains(".")) {
+            // Match all known names ending with '.' + typeName OR equal to typeName
+            List<String> matches = knownNames.stream()
+                    .filter(n -> n.equals(typeName) || n.endsWith("." + typeName))
+                    .collect(Collectors.toList());
+            if (matches.size() == 1) {
+                return matches.get(0);
+            } else if (matches.size() > 1) {
+                System.err.println("Warning: Ambiguous unqualified type name '" + typeName + "' matched multiple schemas: " + matches);
+            }
+            // No matches or ambiguities - treat as unknown type
+            return null;
+        }
+        // Type name is qualified but not found in known names
+        return null;
+    }
+
+    /**
+     * Topological sort based on dependencies.
+     * Throws RuntimeException on cycles.
      */
     static List<String> topologicalSort(Set<String> names, Map<String, Set<String>> dependencies) {
         List<String> sorted = new ArrayList<>();
@@ -213,15 +236,12 @@ public class AvroSchemaResolver {
         for (String name : names) {
             dfs(name, dependencies, visited, visiting, sorted);
         }
-        // DFS adds dependencies before dependents, so no reversal required
         return sorted;
     }
 
     private static void dfs(String name, Map<String, Set<String>> dependencies,
                             Set<String> visited, Set<String> visiting, List<String> sorted) {
-        if (visited.contains(name)) {
-            return;
-        }
+        if (visited.contains(name)) return;
         if (visiting.contains(name)) {
             throw new RuntimeException("Cycle detected in schema dependencies at: " + name);
         }
