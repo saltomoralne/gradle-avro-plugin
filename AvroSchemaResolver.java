@@ -7,9 +7,10 @@ import org.apache.avro.Schema;
 import java.io.IOException;
 import java.io.PrintWriter;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
-import java.nio.file.Paths;
+import java.nio.file.*;
 import java.util.*;
+import java.util.stream.Collectors;
+import java.util.stream.Stream;
 
 public class AvroSchemaResolver {
 
@@ -18,36 +19,48 @@ public class AvroSchemaResolver {
             System.err.println("Usage: java AvroSchemaResolver <inputDir> <outputFile>");
             System.exit(1);
         }
-        String inputDir = args[0];
-        String outputFile = args[1];
+        Path inputDir = Paths.get(args[0]);
+        Path outputFile = Paths.get(args[1]);
 
         ObjectMapper mapper = new ObjectMapper();
 
-        // 1. Read all .avsc files as raw JSON strings, keyed by schema full name
-        Map<String, String> schemaJsons = new HashMap<>();
+        // Map schema fullname -> JSON Schema string
+        Map<String, String> schemaJsons = new LinkedHashMap<>();
 
-        Files.list(Paths.get(inputDir))
-                .filter(path -> path.toString().endsWith(".avsc"))
-                .forEach(path -> {
-                    try {
-                        String json = new String(Files.readAllBytes(path), StandardCharsets.UTF_8);
-                        if (json.startsWith("\uFEFF")) {
-                            json = json.substring(1);
-                        }
-                        JsonNode root = mapper.readTree(json);
-                        String fullName = getFullName(root);
-                        if (fullName == null) {
-                            throw new RuntimeException("Schema missing name or namespace in file: " + path);
-                        }
-                        schemaJsons.put(fullName, json);
-                    } catch (IOException e) {
-                        throw new RuntimeException("Failed to read schema file: " + path, e);
+        // Read all .avsc files, parse possibly multiple schemas inside each file
+        try (Stream<Path> stream = Files.walk(inputDir)) {
+            List<Path> files = stream
+                    .filter(path -> path.toString().endsWith(".avsc"))
+                    .collect(Collectors.toList());
+
+            for (Path file : files) {
+                String jsonText = Files.readString(file, StandardCharsets.UTF_8);
+                if (jsonText.startsWith("\uFEFF")) {
+                    jsonText = jsonText.substring(1);
+                }
+
+                JsonNode root = mapper.readTree(jsonText);
+
+                if (root.isArray()) {
+                    // Multiple schemas in JSON array
+                    for (JsonNode schemaNode : root) {
+                        processSchemaNode(schemaNode, schemaJsons, mapper);
                     }
-                });
+                } else if (root.has("protocol") && root.has("types")) {
+                    // Avro protocol file with "types" array
+                    JsonNode typesNode = root.get("types");
+                    for (JsonNode schemaNode : typesNode) {
+                        processSchemaNode(schemaNode, schemaJsons, mapper);
+                    }
+                } else {
+                    // Single schema object
+                    processSchemaNode(root, schemaJsons, mapper);
+                }
+            }
+        }
 
-        // 2. Extract dependencies for each schema (without using Avro parser)
+        // Extract dependencies from each schema JSON
         Map<String, Set<String>> dependencies = new HashMap<>();
-
         for (Map.Entry<String, String> entry : schemaJsons.entrySet()) {
             JsonNode root = mapper.readTree(entry.getValue());
             Set<String> deps = new HashSet<>();
@@ -55,29 +68,27 @@ public class AvroSchemaResolver {
             dependencies.put(entry.getKey(), deps);
         }
 
-        // 3. Topologically sort schemas by dependencies
+        // Topological sort schemas by dependency
         List<String> sortedNames = topologicalSort(schemaJsons.keySet(), dependencies);
 
-        // Debug: print parse order
         System.out.println("Schema parse order (dependencies first):");
-        for (String name : sortedNames) {
-            System.out.println("  " + name);
+        for (String n : sortedNames) {
+            System.out.println("  " + n);
         }
 
-        // 4. Parse schemas in dependency order with a single shared Avro Schema.Parser
+        // Parse schemas in dependency order using one Avro Schema.Parser instance
         Schema.Parser parser = new Schema.Parser();
         List<Schema> parsedSchemas = new ArrayList<>();
         for (String name : sortedNames) {
-            String json = schemaJsons.get(name);
-            if (json == null) {
-                throw new RuntimeException("Schema JSON missing for: " + name);
+            String schemaJson = schemaJsons.get(name);
+            if (schemaJson == null) {
+                throw new RuntimeException("Missing JSON content for schema " + name);
             }
-            Schema schema = parser.parse(json);
-            parsedSchemas.add(schema);
+            parsedSchemas.add(parser.parse(schemaJson));
         }
 
-        // 5. Write combined schema as JSON array to output file
-        try (PrintWriter writer = new PrintWriter(outputFile)) {
+        // Write combined schemas as JSON array to output file
+        try (PrintWriter writer = new PrintWriter(Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8))) {
             writer.println("[");
             for (int i = 0; i < parsedSchemas.size(); i++) {
                 writer.print(parsedSchemas.get(i).toString(true));
@@ -87,7 +98,20 @@ public class AvroSchemaResolver {
             }
             writer.println("\n]");
         }
+
         System.out.println("Combined schema written to: " + outputFile);
+    }
+
+    private static void processSchemaNode(JsonNode schemaNode, Map<String, String> schemaJsons, ObjectMapper mapper) throws IOException {
+        String fullName = getFullName(schemaNode);
+        if (fullName == null) {
+            throw new RuntimeException("Schema missing 'name' field or namespace");
+        }
+        String jsonStr = mapper.writeValueAsString(schemaNode);
+        if (schemaJsons.containsKey(fullName)) {
+            System.err.println("Warning: duplicate schema detected for '" + fullName + "'. Overriding previous definition.");
+        }
+        schemaJsons.put(fullName, jsonStr);
     }
 
     static String getFullName(JsonNode root) {
@@ -97,22 +121,18 @@ public class AvroSchemaResolver {
         String name = root.get("name").asText();
         if (root.has("namespace")) {
             return root.get("namespace").asText() + "." + name;
-        } else {
-            return name;
         }
+        return name;
     }
 
     /**
-     * Recursively find user-defined schema dependencies from JSON representation.
-     *
-     * @param node       JSON node representing schema or type
-     * @param deps       set to collect full names of dependencies found
-     * @param knownNames set of all known schema names (to detect references)
+     * Recursively find user-defined schema dependencies from JSON node.
+     * @param node JSON schema or type node
+     * @param deps a set to collect full names of dependencies found
+     * @param knownNames all known schema full names
      */
     static void findDependencies(JsonNode node, Set<String> deps, Set<String> knownNames) {
-        if (node == null || node.isNull()) {
-            return;
-        }
+        if (node == null || node.isNull()) return;
 
         if (node.isTextual()) {
             String typeName = node.asText();
@@ -123,42 +143,51 @@ public class AvroSchemaResolver {
         }
 
         if (node.isObject()) {
-            String type = node.has("type") ? node.get("type").asText() : null;
-            if (type == null) {
-                // No "type" field? Check all child nodes
+            JsonNode typeNode = node.get("type");
+            if (typeNode == null) {
+                // No "type" field, check all child nodes recursively
                 for (JsonNode child : node) {
                     findDependencies(child, deps, knownNames);
                 }
                 return;
             }
 
-            switch (type) {
-                case "record":
-                case "error":
-                    if (node.has("fields")) {
-                        for (JsonNode field : node.get("fields")) {
-                            findDependencies(field.get("type"), deps, knownNames);
+            if (typeNode.isTextual()) {
+                String type = typeNode.asText();
+                switch (type) {
+                    case "record":
+                    case "error":
+                        JsonNode fields = node.get("fields");
+                        if (fields != null) {
+                            for (JsonNode field : fields) {
+                                findDependencies(field.get("type"), deps, knownNames);
+                            }
                         }
-                    }
-                    break;
-                case "array":
-                    findDependencies(node.get("items"), deps, knownNames);
-                    break;
-                case "map":
-                    findDependencies(node.get("values"), deps, knownNames);
-                    break;
-                case "union":
-                    if (node.has("types")) {
-                        for (JsonNode typeNode : node.get("types")) {
-                            findDependencies(typeNode, deps, knownNames);
+                        break;
+                    case "array":
+                        findDependencies(node.get("items"), deps, knownNames);
+                        break;
+                    case "map":
+                        findDependencies(node.get("values"), deps, knownNames);
+                        break;
+                    case "union":
+                        JsonNode types = node.get("types");
+                        if (types != null) {
+                            for (JsonNode t : types) {
+                                findDependencies(t, deps, knownNames);
+                            }
                         }
-                    }
-                    break;
-                default:
-                    if (knownNames.contains(type)) {
-                        deps.add(type);
-                    }
-                    break;
+                        break;
+                    default:
+                        if (knownNames.contains(type)) {
+                            deps.add(type);
+                        }
+                }
+            } else if (typeNode.isArray()) {
+                // Defensive: type node array (rare)
+                for (JsonNode t : typeNode) {
+                    findDependencies(t, deps, knownNames);
+                }
             }
             return;
         }
@@ -171,12 +200,10 @@ public class AvroSchemaResolver {
     }
 
     /**
-     * Topological sort (dependency order) on the schema full names.
-     * Dependencies come before dependents in the result list.
-     *
-     * @param names        Set of all schema full names.
-     * @param dependencies Map of schema full name -> set of dependencies.
-     * @return List of schema full names sorted in dependency order.
+     * Topological sort based on dependency graph.
+     * @param names set of schema full names
+     * @param dependencies map: schema full name -> set of dependencies
+     * @return list of schema full names sorted so dependencies come before dependents
      */
     static List<String> topologicalSort(Set<String> names, Map<String, Set<String>> dependencies) {
         List<String> sorted = new ArrayList<>();
@@ -186,14 +213,11 @@ public class AvroSchemaResolver {
         for (String name : names) {
             dfs(name, dependencies, visited, visiting, sorted);
         }
-
-        // Remove reversal here because list is already correct
-        // Collections.reverse(sorted);
-
+        // DFS adds dependencies before dependents, so no reversal needed
         return sorted;
     }
 
-     static void dfs(String name, Map<String, Set<String>> dependencies, Set<String> visited,
+    private static void dfs(String name, Map<String, Set<String>> dependencies, Set<String> visited,
                             Set<String> visiting, List<String> sorted) {
         if (visited.contains(name)) {
             return;
