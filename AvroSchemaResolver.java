@@ -1,3 +1,5 @@
+package org.example;
+
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.avro.Schema;
@@ -22,13 +24,12 @@ public class AvroSchemaResolver {
 
         ObjectMapper mapper = new ObjectMapper();
 
-        // 1. Read all schemas from .avsc files (single or multiple schemas per file)
+        // 1. Read all schemas from all .avsc files (support multiple schemas per file)
         Map<String, String> schemaJsons = new LinkedHashMap<>();
-
         try (Stream<Path> stream = Files.walk(inputDir)) {
             List<Path> files = stream
-                .filter(path -> path.toString().endsWith(".avsc"))
-                .collect(Collectors.toList());
+                    .filter(path -> path.toString().endsWith(".avsc"))
+                    .collect(Collectors.toList());
 
             for (Path file : files) {
                 String jsonText = Files.readString(file, StandardCharsets.UTF_8);
@@ -39,18 +40,15 @@ public class AvroSchemaResolver {
                 JsonNode root = mapper.readTree(jsonText);
 
                 if (root.isArray()) {
-                    // Multiple schemas in an array
                     for (JsonNode schemaNode : root) {
                         processSchemaNode(schemaNode, schemaJsons, mapper);
                     }
                 } else if (root.has("protocol") && root.has("types")) {
-                    // Avro protocol file
                     JsonNode typesNode = root.get("types");
                     for (JsonNode schemaNode : typesNode) {
                         processSchemaNode(schemaNode, schemaJsons, mapper);
                     }
                 } else {
-                    // Single schema object
                     processSchemaNode(root, schemaJsons, mapper);
                 }
             }
@@ -65,7 +63,7 @@ public class AvroSchemaResolver {
             dependencies.put(entry.getKey(), deps);
         }
 
-        // 3. Topological sort
+        // 3. Topological sort schemas by dependencies
         List<String> sortedNames = topologicalSort(schemaJsons.keySet(), dependencies);
 
         System.out.println("Schema parse order (dependencies first):");
@@ -73,23 +71,32 @@ public class AvroSchemaResolver {
             System.out.println("  " + name);
         }
 
-        // 4. Parse schemas in order with one parser
+        // 4. Parse schemas with one Avro parser
         Schema.Parser parser = new Schema.Parser();
-        List<Schema> parsedSchemas = new ArrayList<>();
-        for (String name : sortedNames) {
-            String schemaJson = schemaJsons.get(name);
-            if (schemaJson == null) {
-                throw new RuntimeException("Schema JSON missing for: " + name);
+        Map<String, Schema> parsedSchemaMap = new HashMap<>();
+        List<Schema> parsedSchemasOrdered = new ArrayList<>();
+        for (String fullname : sortedNames) {
+            String json = schemaJsons.get(fullname);
+            if (json == null) {
+                throw new RuntimeException("Schema JSON missing for: " + fullname);
             }
-            parsedSchemas.add(parser.parse(schemaJson));
+            Schema schema = parser.parse(json);
+            parsedSchemaMap.put(fullname, schema);
+            parsedSchemasOrdered.add(schema);
         }
 
-        // 5. Write combined schemas as JSON array
+        // 5. Replace inline named schema definitions with references
+        List<Schema> outputSchemas = new ArrayList<>();
+        for (Schema s : parsedSchemasOrdered) {
+            outputSchemas.add(replaceInlineWithRefs(s, parsedSchemaMap));
+        }
+
+        // 6. Write combined schemas as JSON array
         try (PrintWriter writer = new PrintWriter(Files.newBufferedWriter(outputFile, StandardCharsets.UTF_8))) {
             writer.println("[");
-            for (int i = 0; i < parsedSchemas.size(); i++) {
-                writer.print(parsedSchemas.get(i).toString(true));
-                if (i < parsedSchemas.size() - 1) {
+            for (int i = 0; i < outputSchemas.size(); i++) {
+                writer.print(outputSchemas.get(i).toString(true));
+                if (i < outputSchemas.size() - 1) {
                     writer.println(",");
                 }
             }
@@ -111,14 +118,8 @@ public class AvroSchemaResolver {
         schemaJsons.put(fullName, jsonStr);
     }
 
-    /**
-     * Extract the full name of the schema from JSON node by concatenating namespace and name.
-     * Returns null if name is missing.
-     */
     static String getFullName(JsonNode root) {
-        if (!root.has("name")) {
-            return null;
-        }
+        if (!root.has("name")) return null;
         String name = root.get("name").asText();
         if (root.has("namespace")) {
             return root.get("namespace").asText() + "." + name;
@@ -126,26 +127,19 @@ public class AvroSchemaResolver {
         return name;
     }
 
-    /**
-     * Recursively find user-defined schema dependencies from JSON node.
-     * Resolves type names to fully qualified names where possible.
-     */
     static void findDependencies(JsonNode node, Set<String> deps, Set<String> knownNames) {
         if (node == null || node.isNull()) return;
 
         if (node.isTextual()) {
             String typeName = node.asText();
             String fullName = resolveFullName(knownNames, typeName);
-            if (fullName != null) {
-                deps.add(fullName);
-            }
+            if (fullName != null) deps.add(fullName);
             return;
         }
 
         if (node.isObject()) {
             JsonNode typeNode = node.get("type");
             if (typeNode == null) {
-                // No "type" field, recursively check children
                 for (JsonNode child : node) {
                     findDependencies(child, deps, knownNames);
                 }
@@ -180,9 +174,7 @@ public class AvroSchemaResolver {
                         break;
                     default:
                         String fullName = resolveFullName(knownNames, type);
-                        if (fullName != null) {
-                            deps.add(fullName);
-                        }
+                        if (fullName != null) deps.add(fullName);
                 }
             } else if (typeNode.isArray()) {
                 for (JsonNode t : typeNode) {
@@ -199,16 +191,11 @@ public class AvroSchemaResolver {
         }
     }
 
-    /**
-     * Resolve a possibly unqualified typeName against known full names.
-     * Returns matching fully qualified name if unique match found, or null otherwise.
-     */
     private static String resolveFullName(Set<String> knownNames, String typeName) {
         if (knownNames.contains(typeName)) {
             return typeName;
         }
         if (!typeName.contains(".")) {
-            // Match all known names ending with '.' + typeName OR equal to typeName
             List<String> matches = knownNames.stream()
                     .filter(n -> n.equals(typeName) || n.endsWith("." + typeName))
                     .collect(Collectors.toList());
@@ -217,17 +204,11 @@ public class AvroSchemaResolver {
             } else if (matches.size() > 1) {
                 System.err.println("Warning: Ambiguous unqualified type name '" + typeName + "' matched multiple schemas: " + matches);
             }
-            // No matches or ambiguities - treat as unknown type
             return null;
         }
-        // Type name is qualified but not found in known names
         return null;
     }
 
-    /**
-     * Topological sort based on dependencies.
-     * Throws RuntimeException on cycles.
-     */
     static List<String> topologicalSort(Set<String> names, Map<String, Set<String>> dependencies) {
         List<String> sorted = new ArrayList<>();
         Set<String> visited = new HashSet<>();
@@ -252,5 +233,53 @@ public class AvroSchemaResolver {
         visiting.remove(name);
         visited.add(name);
         sorted.add(name);
+    }
+
+    /**
+     * Replace inline named schema definitions with references to fully qualified names.
+     * This avoids embedding full schema definitions multiple times.
+     */
+    private static Schema replaceInlineWithRefs(Schema schema, Map<String, Schema> fullNameToSchema) {
+        switch (schema.getType()) {
+            case RECORD:
+            case ERROR:
+                List<Schema.Field> newFields = new ArrayList<>();
+                for (Schema.Field field : schema.getFields()) {
+                    Schema replaced = replaceInlineWithRefs(field.schema(), fullNameToSchema);
+                    if (isNamedType(replaced) && fullNameToSchema.containsKey(replaced.getFullName())) {
+                        replaced = Schema.createRef(replaced.getFullName());
+                    }
+                    Schema.Field newField = new Schema.Field(field.name(), replaced, field.doc(), field.defaultVal(), field.order());
+                    newFields.add(newField);
+                }
+                Schema newRecord = Schema.createRecord(schema.getName(), schema.getDoc(), schema.getNamespace(), schema.isError());
+                newRecord.setFields(newFields);
+                return newRecord;
+
+            case ARRAY:
+                return Schema.createArray(replaceInlineWithRefs(schema.getElementType(), fullNameToSchema));
+
+            case MAP:
+                return Schema.createMap(replaceInlineWithRefs(schema.getValueType(), fullNameToSchema));
+
+            case UNION:
+                List<Schema> newTypes = new ArrayList<>();
+                for (Schema s : schema.getTypes()) {
+                    Schema replaced = replaceInlineWithRefs(s, fullNameToSchema);
+                    if (isNamedType(replaced) && fullNameToSchema.containsKey(replaced.getFullName())) {
+                        replaced = Schema.createRef(replaced.getFullName());
+                    }
+                    newTypes.add(replaced);
+                }
+                return Schema.createUnion(newTypes);
+
+            default:
+                return schema;
+        }
+    }
+
+    private static boolean isNamedType(Schema schema) {
+        Schema.Type t = schema.getType();
+        return t == Schema.Type.RECORD || t == Schema.Type.ENUM || t == Schema.Type.FIXED || t == Schema.Type.ERROR;
     }
 }
