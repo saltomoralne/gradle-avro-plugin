@@ -1,44 +1,48 @@
-package org.example;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.ObjectWriter;
 
 import java.io.File;
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.StandardCopyOption;
 import java.util.*;
 
-public class AvroSchemaResolver {
+public class AvroSchemaSorter {
 
     private static final String AVSC_SUFFIX = ".avsc";
     private static final ObjectMapper mapper = new ObjectMapper();
 
     public static void main(String[] args) throws Exception {
-        if (args.length != 1) {
-            System.err.println("Usage: java AvroSchemaSorter <folder_with_avsc_files>");
+        if (args.length < 1) {
+            System.err.println("Usage: java AvroSchemaSorter <folder1> [folder2 folder3 ...]");
             System.exit(1);
         }
 
-        File folder = new File(args[0]);
-        if (!folder.isDirectory()) {
-            System.err.println("Provided path is not a directory");
+        // Collect all .avsc files from all input directories
+        List<File> schemaFiles = new ArrayList<>();
+        for (String folderPath : args) {
+            File folder = new File(folderPath);
+            if (!folder.isDirectory()) {
+                System.err.println("Warning: " + folderPath + " is not a directory. Skipping.");
+                continue;
+            }
+            File[] files = folder.listFiles((dir, name) -> name.endsWith(AVSC_SUFFIX));
+            if (files != null) {
+                schemaFiles.addAll(Arrays.asList(files));
+            }
+        }
+
+        if (schemaFiles.isEmpty()) {
+            System.err.println("No .avsc files found in given directories.");
             System.exit(1);
         }
 
-        File[] files = folder.listFiles((dir, name) -> name.endsWith(AVSC_SUFFIX));
-        if (files == null || files.length == 0) {
-            System.err.println("No .avsc files found in folder");
-            System.exit(1);
-        }
-
-        // Step 1: Parse schemas and collect each schema separately
+        // Step 1: Parse all schemas (multiple dirs supported)
         Map<String, SchemaFile> nameToSchema = new HashMap<>();
-
-        for (File file : files) {
+        for (File file : schemaFiles) {
             JsonNode root = mapper.readTree(file);
-
             if (root.isArray()) {
-                // Multiple schemas in one file (array root)
                 for (JsonNode item : root) {
                     String fullName = getFullName(item);
                     if (fullName == null) {
@@ -47,7 +51,6 @@ public class AvroSchemaResolver {
                     nameToSchema.put(fullName, new SchemaFile(fullName, file, item));
                 }
             } else if (root.isObject()) {
-                // Single schema per file
                 String fullName = getFullName(root);
                 if (fullName == null) {
                     throw new IllegalArgumentException("Schema in file " + file.getName() + " missing name");
@@ -58,66 +61,51 @@ public class AvroSchemaResolver {
             }
         }
 
-        // Step 2: Determine dependencies for each schema (resolve short names relative to namespace)
+        // Step 2: Determine dependencies
         for (SchemaFile schema : nameToSchema.values()) {
             String currentNamespace = getNamespace(schema.root);
             Set<String> deps = findDependencies(schema.root, nameToSchema.keySet(), currentNamespace);
-            deps.remove(schema.name); // Remove self-dependency if any
+            deps.remove(schema.name); // Remove self
             schema.dependencies.addAll(deps);
         }
 
-        // Step 3: Topological sort to order dependencies first
+        // Step 3: Topological sort
         List<SchemaFile> sortedSchemas = topologicalSort(nameToSchema);
 
-        // Step 4: Write output schemas separately to files with numbered prefix and schema full name
+        // Step 4: Output files to the first input folder given (can be changed)
+        File outputFolder = new File(args[0]);
+        if (!outputFolder.isDirectory()) {
+            System.err.println("First input argument is not a directory. Cannot output files.");
+            System.exit(1);
+        }
+
         ObjectWriter writer = mapper.writerWithDefaultPrettyPrinter();
         int index = 1;
 
         for (SchemaFile schema : sortedSchemas) {
-            // Replace dots with underscores for safe filename
             String safeName = schema.name.replace('.', '_') + AVSC_SUFFIX;
             String outputFileName = String.format("%02d_%s", index++, safeName);
-            File outputFile = new File(folder, outputFileName);
+            File outputFile = new File(outputFolder, outputFileName);
 
             writer.writeValue(outputFile, schema.root);
-
-            System.out.println("Output: " + outputFile.getName());
+            System.out.println("Output: " + outputFile.getAbsolutePath());
         }
     }
 
-    /**
-     * Extract full name (namespace + name) of the schema node.
-     * Returns null if "name" is missing.
-     */
     private static String getFullName(JsonNode root) {
-        if (!root.has("name")) {
-            return null;
-        }
+        if (!root.has("name")) return null;
         String name = root.get("name").asText();
         String namespace = getNamespace(root);
-
-        if (name.contains(".")) {
-            // Already qualified
-            return name;
-        }
+        if (name.contains(".")) return name;
         return namespace.isEmpty() ? name : namespace + "." + name;
     }
 
-    /**
-     * Helper to get the namespace string or empty if not present.
-     */
     private static String getNamespace(JsonNode node) {
-        if (node.has("namespace") && node.get("namespace").isTextual()) {
-            return node.get("namespace").asText();
-        }
-        return "";
+        return (node.has("namespace") && node.get("namespace").isTextual())
+                ? node.get("namespace").asText()
+                : "";
     }
 
-    /**
-     * Recursively find all schema dependencies in the node.
-     * Resolves short type names relative to the given current namespace.
-     * Only returns dependencies that exist in knownTypes.
-     */
     private static Set<String> findDependencies(JsonNode node, Set<String> knownTypes, String currentNamespace) {
         Set<String> deps = new HashSet<>();
         if (node == null) return deps;
@@ -129,104 +117,73 @@ public class AvroSchemaResolver {
                 if (typeNode.isTextual()) {
                     String typeName = typeNode.asText();
                     String fullTypeName = resolveFullName(typeName, currentNamespace);
-                    if (knownTypes.contains(fullTypeName)) {
-                        deps.add(fullTypeName);
-                    }
-                    // else primitive or unknown, ignore
+                    if (knownTypes.contains(fullTypeName)) deps.add(fullTypeName);
                 } else if (typeNode.isArray()) {
-                    // Union type - array of types
                     for (JsonNode subtype : typeNode) {
                         deps.addAll(findDependencies(subtype, knownTypes, currentNamespace));
                     }
                 } else if (typeNode.isObject()) {
-                    String complexType = typeNode.has("type") ? typeNode.get("type").asText() : null;
-                    if ("array".equals(complexType)) {
+                    String cType = typeNode.has("type") ? typeNode.get("type").asText() : null;
+                    if ("array".equals(cType)) {
                         deps.addAll(findDependencies(typeNode.get("items"), knownTypes, currentNamespace));
-                    } else if ("map".equals(complexType)) {
+                    } else if ("map".equals(cType)) {
                         deps.addAll(findDependencies(typeNode.get("values"), knownTypes, currentNamespace));
                     } else {
-                        // Inline nested complex types (record, enum, fixed)
                         deps.addAll(findDependencies(typeNode, knownTypes, currentNamespace));
                     }
                 }
             }
 
-            // Recurse into other fields too (e.g., fields array)
-            Iterator<String> fieldsIter = node.fieldNames();
-            while (fieldsIter.hasNext()) {
-                String field = fieldsIter.next();
-                if (!"type".equals(field)) {
-                    deps.addAll(findDependencies(node.get(field), knownTypes, currentNamespace));
+            Iterator<String> fields = node.fieldNames();
+            while (fields.hasNext()) {
+                String f = fields.next();
+                if (!"type".equals(f)) {
+                    deps.addAll(findDependencies(node.get(f), knownTypes, currentNamespace));
                 }
             }
         } else if (node.isArray()) {
-            for (JsonNode item : node) {
-                deps.addAll(findDependencies(item, knownTypes, currentNamespace));
-            }
+            for (JsonNode item : node) deps.addAll(findDependencies(item, knownTypes, currentNamespace));
         } else if (node.isTextual()) {
-            // Node itself is a type name string
             String typeName = node.asText();
             String fullTypeName = resolveFullName(typeName, currentNamespace);
-            if (knownTypes.contains(fullTypeName)) {
-                deps.add(fullTypeName);
-            }
+            if (knownTypes.contains(fullTypeName)) deps.add(fullTypeName);
         }
-        // others (number, boolean, null) are ignored
-
         return deps;
     }
 
-    /**
-     * Resolve a possibly short type name (without dot) relative to current namespace,
-     * or return as is if already fully qualified.
-     */
     private static String resolveFullName(String typeName, String currentNamespace) {
-        if (typeName.contains(".")) {
-            return typeName;
-        }
+        if (typeName.contains(".")) return typeName;
         return currentNamespace.isEmpty() ? typeName : currentNamespace + "." + typeName;
     }
 
-    /**
-     * Perform topological sorting of schemas by dependencies using Kahn's algorithm.
-     * Throws RuntimeException on cyclic dependencies.
-     */
-    private static List<SchemaFile> topologicalSort(Map<String, SchemaFile> nameToSchema) {
+    private static List<SchemaFile> topologicalSort(Map<String, SchemaFile> schemas) {
         Map<String, Integer> indegree = new HashMap<>();
-        for (String name : nameToSchema.keySet()) {
-            indegree.put(name, 0);
-        }
-        for (SchemaFile schema : nameToSchema.values()) {
-            for (String dep : schema.dependencies) {
-                indegree.put(dep, indegree.get(dep) + 1);
+        for (String key : schemas.keySet()) indegree.put(key, 0);
+        for (SchemaFile sf : schemas.values()) {
+            for (String d : sf.dependencies) {
+                indegree.put(d, indegree.get(d) + 1);
             }
         }
 
         Queue<SchemaFile> queue = new LinkedList<>();
-        for (Map.Entry<String, Integer> entry : indegree.entrySet()) {
-            if (entry.getValue() == 0) {
-                queue.add(nameToSchema.get(entry.getKey()));
-            }
+        for (Map.Entry<String, Integer> e : indegree.entrySet()) {
+            if (e.getValue() == 0) queue.add(schemas.get(e.getKey()));
         }
 
         List<SchemaFile> sorted = new ArrayList<>();
         while (!queue.isEmpty()) {
-            SchemaFile schema = queue.poll();
-            sorted.add(schema);
-
-            for (String dep : schema.dependencies) {
-                indegree.put(dep, indegree.get(dep) - 1);
-                if (indegree.get(dep) == 0) {
-                    queue.add(nameToSchema.get(dep));
-                }
+            SchemaFile sf = queue.poll();
+            sorted.add(sf);
+            for (String d : sf.dependencies) {
+                indegree.put(d, indegree.get(d) - 1);
+                if (indegree.get(d) == 0) queue.add(schemas.get(d));
             }
         }
 
-        if (sorted.size() != nameToSchema.size()) {
-            throw new RuntimeException("Cyclic dependency detected or missing schema reference.");
+        if (sorted.size() != schemas.size()) {
+            throw new RuntimeException("Cyclic dependencies or missing references detected.");
         }
 
-        // Reverse so dependencies appear first, dependents later
         Collections.reverse(sorted);
         return sorted;
     }
