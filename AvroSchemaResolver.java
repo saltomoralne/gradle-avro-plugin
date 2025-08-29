@@ -201,3 +201,131 @@ public class AvroSchemaSorter {
         }
     }
 }
+
+
+
+/*
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'com.github.davidmc24.gradle.plugin:gradle-avro-plugin:1.9.1'
+    implementation 'org.apache.avro:avro:1.11.0'
+    implementation 'org.apache.commons:commons-collections4:4.4'
+    implementation 'org.slf4j:slf4j-api:1.7.30'
+    implementation 'org.slf4j:slf4j-simple:1.7.30'
+}
+
+////////////////////////////
+package com.example
+
+import com.github.davidmc24.gradle.plugin.avro.ProcessingState
+import com.github.davidmc24.gradle.plugin.avro.FileState
+import com.github.davidmc24.gradle.plugin.avro.MapUtils
+import org.apache.avro.Schema
+import org.apache.avro.SchemaParseException
+//import org.apache.commons.collections4.MapUtils
+import org.gradle.api.GradleException
+
+import java.util.regex.Matcher
+import java.util.regex.Pattern
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
+import java.io.File
+import java.io.IOException
+
+class ProcessSchemaInterceptor {
+
+    private static final Logger logger = LoggerFactory.getLogger(ProcessSchemaInterceptor)
+    private static final Pattern ERROR_UNKNOWN_TYPE = Pattern.compile(".*Undefined name:.*")
+    private static final Pattern ERROR_DUPLICATE_TYPE = Pattern.compile(".*Found duplicate type: (.*)")
+
+    static void processSchemaFile(ProcessingState processingState, FileState fileState) {
+        String path = fileState.getPath()
+        logger.debug("Processing {}, excluding types {}", path, fileState.getDuplicateTypeNames())
+        File sourceFile = fileState.getFile()
+        Map<String, Schema> parserTypes = processingState.determineParserTypes(fileState)
+        try {
+
+
+            org.apache.avro.Schema$Parser parser = new org.apache.avro.Schema$Parser()
+            parser.addTypes(parserTypes)
+            parser.parse(sourceFile)
+            Map<String, Schema> typesDefinedInFile = MapUtils.asymmetricDifference(parser.getTypes(), parserTypes)
+            processingState.processTypeDefinitions(fileState, typesDefinedInFile)
+            if (logger.isDebugEnabled()) {
+                logger.debug("Processed {}; contained types {}", path, typesDefinedInFile.keySet())
+            } else {
+                logger.info("Processed {}", path)
+            }
+        } catch (SchemaParseException ex) {
+            String errorMessage = ex.getMessage()
+            Matcher unknownTypeMatcher = ERROR_UNKNOWN_TYPE.matcher(errorMessage)
+            Matcher duplicateTypeMatcher = ERROR_DUPLICATE_TYPE.matcher(errorMessage)
+            if (unknownTypeMatcher.matches()) {
+                fileState.setError(ex)
+                processingState.queueForDelayedProcessing(fileState)
+                logger.debug("Found undefined name in {} ({}); will try again", path, errorMessage)
+            } else if (duplicateTypeMatcher.matches()) {
+                String typeName = duplicateTypeMatcher.group(1)
+                if (fileState.containsDuplicateTypeName(typeName)) {
+                    throw new GradleException(
+                            String.format("Failed to resolve schema definition file %s; contains duplicate type definition %s", path, typeName),
+                            ex)
+                } else {
+                    fileState.setError(ex)
+                    fileState.addDuplicateTypeName(typeName)
+                    processingState.queueForProcessing(fileState)
+                    logger.debug("Identified duplicate type {} in {}; will re-process excluding it", typeName, path)
+                }
+            } else {
+                throw new GradleException(String.format("Failed to resolve schema definition file %s", path), ex)
+            }
+        } catch (IOException ex) {
+            throw new GradleException(String.format("Failed to resolve schema definition file %s", path), ex)
+        }
+    }
+}
+//////////////////////////////////
+
+
+
+
+import net.bytebuddy.ByteBuddy
+import net.bytebuddy.agent.ByteBuddyAgent
+import net.bytebuddy.asm.Advice
+import net.bytebuddy.dynamic.loading.ClassReloadingStrategy
+import net.bytebuddy.matcher.ElementMatchers
+import net.bytebuddy.implementation.MethodDelegation
+
+import com.github.davidmc24.gradle.plugin.avro.SchemaResolver
+
+import com.example.ProcessSchemaInterceptor
+
+ task replaceProcessSchemaFile {
+    doFirst {
+        println "Installing ByteBuddy agent and redefining processSchemaFile..."
+
+        ByteBuddyAgent.install()
+
+        new ByteBuddy()
+                .redefine(SchemaResolver)
+                .method(ElementMatchers.named("processSchemaFile"))
+                .intercept(MethodDelegation.to(ProcessSchemaInterceptor.class))
+                .make()
+                .load(com.github.davidmc24.gradle.plugin.avro.SchemaResolver.getClassLoader(), ClassReloadingStrategy.fromInstalledAgent())
+
+        println "Method processSchemaFile replaced successfully."
+    }
+}
+
+
+
+ tasks.named('generateAvroSchemas') {
+    dependsOn replaceProcessSchemaFile
+}
+
+
+
+*/
