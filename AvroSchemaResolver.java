@@ -329,3 +329,73 @@ import com.example.ProcessSchemaInterceptor
 
 
 */
+
+
+
+
+
+
+
+/*
+
+import com.github.davidmc24.gradle.plugin.avro.GenerateAvroJavaTask
+
+
+task generateAvroSchemas(type: GenerateAvroJavaTask) {
+    source("src/main/avro")
+    outputDir = file("$buildDir/generated-avro-schemas")
+}
+
+
+import net.bytebuddy.agent.ByteBuddyAgent
+import net.bytebuddy.ByteBuddy
+import net.bytebuddy.matcher.ElementMatchers
+import net.bytebuddy.dynamic.loading.ClassReloadingStrategy
+import net.bytebuddy.implementation.MethodDelegation
+
+task redefineSchemaResolver {
+
+    doLast {
+        def gradleClassLoader = this.class.classLoader
+        def interceptorClass = gradleClassLoader.loadClass('com.example.bytebuddy.SchemaResolverInterceptor')
+
+        ByteBuddyAgent.install()
+        def load = new ByteBuddy()
+                .redefine(Class.forName('com.github.davidmc24.gradle.plugin.avro.SchemaResolver'))
+                .method(ElementMatchers.named('processSchemaFile').and(ElementMatchers.takesArguments(2)))
+                .intercept(MethodDelegation.to(interceptorClass))
+                .make()
+                .load(gradleClassLoader, ClassReloadingStrategy.fromInstalledAgent())
+        println "SchemaResolver.processSchemaFile method redefined with custom implementation"
+    }
+}
+
+tasks.named('generateAvroSchemas') {
+    dependsOn redefineSchemaResolver
+}
+
+
+
+
+
+
+plugins {
+    id 'java'
+    id 'groovy'
+}
+
+repositories {
+    mavenCentral()
+}
+
+dependencies {
+    implementation 'org.codehaus.groovy:groovy-all:3.0.22'
+    implementation 'com.github.davidmc24.gradle.plugin:gradle-avro-plugin:1.9.1'
+    implementation 'org.apache.avro:avro:1.12.0'
+    implementation 'org.apache.commons:commons-collections4:4.4'
+    implementation 'org.slf4j:slf4j-api:1.7.30'
+    implementation 'org.slf4j:slf4j-simple:1.7.30'
+}
+
+*/
+
